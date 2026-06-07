@@ -770,8 +770,11 @@ impl<'r> Converter<'r> {
             TagEnd::Table => {
                 let ctx = self.block_stack.pop();
                 if let Some(BlockCtx::Table(buf)) = ctx {
-                    let theme = self.renderer.theme();
-                    let lines = Self::render_table(&buf, theme);
+                    let lines = if let Some(f) = &self.renderer.table {
+                        f(&buf.header, &buf.rows, self.renderer.theme())
+                    } else {
+                        Self::render_table(&buf, self.renderer.theme())
+                    };
                     self.lines.extend(lines);
                     self.lines.push(Line::default());
                 }
@@ -1512,4 +1515,38 @@ mod tests {
             "child and sibling on same line: {lines:?}"
         );
     }
+    #[test]
+    fn custom_table_renderer_receives_cells() {
+        let renderer = RendererBuilder::new()
+            .with_table(|header, rows, _theme| {
+                let mut lines = Vec::new();
+                lines.push(Line::raw(format!("HDR={}", header.join(","))));
+                for row in rows {
+                    lines.push(Line::raw(format!("ROW={}", row.join(","))));
+                }
+                lines
+            })
+            .build();
+        let md = "| A | B |\n|---|---|\n| 1 | 2 |";
+        let text = convert_with(md, &renderer);
+        let p = plain_text(&text);
+        assert!(p.contains("HDR=A,B"), "custom header not rendered: {p}");
+        assert!(p.contains("ROW=1,2"), "custom body not rendered: {p}");
+    }
+
+    #[test]
+    fn custom_table_renderer_overrides_default() {
+        let renderer = RendererBuilder::new()
+            .with_table(|_header, _rows, _theme| {
+                vec![Line::raw("CUSTOM_TABLE")]
+            })
+            .build();
+        let md = "| X | Y |\n|---|---|\n| 1 | 2 |";
+        let text = convert_with(md, &renderer);
+        let p = plain_text(&text);
+        assert!(p.contains("CUSTOM_TABLE"), "custom table renderer should override default: {p}");
+        // Should NOT contain default separator characters
+        assert!(!p.contains('┼'), "default separator should not appear: {p}");
+    }
+
 }
