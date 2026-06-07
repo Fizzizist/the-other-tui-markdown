@@ -62,6 +62,12 @@ pub type RuleFn = dyn Fn() -> Vec<Line<'static>> + Send + Sync;
 /// Argument: `label` (e.g. `"1"` for `[^1]`).
 pub type FootnoteRefFn = dyn Fn(&str) -> Vec<Span<'static>> + Send + Sync;
 
+/// Renders a table into a sequence of [`Line`]s.
+///
+/// Receives column headers, body rows, and the active [`Theme`].
+/// A trailing blank line is added by the caller.
+pub type TableFn = dyn Fn(&[String], &[Vec<String>], &Theme) -> Vec<Line<'static>> + Send + Sync;
+
 // ── Renderer ─────────────────────────────────────────────────────────────────
 
 /// Holds the [`Theme`] and all optional per-element custom renderers.
@@ -76,6 +82,7 @@ pub struct Renderer {
     pub(crate) heading: Option<Box<HeadingFn>>,
     pub(crate) rule: Option<Box<RuleFn>>,
     pub(crate) footnote_ref: Option<Box<FootnoteRefFn>>,
+    pub(crate) table: Option<Box<TableFn>>,
 }
 
 impl Renderer {
@@ -101,6 +108,7 @@ pub struct RendererBuilder {
     heading: Option<Box<HeadingFn>>,
     rule: Option<Box<RuleFn>>,
     footnote_ref: Option<Box<FootnoteRefFn>>,
+    table: Option<Box<TableFn>>,
 }
 
 impl Default for RendererBuilder {
@@ -121,6 +129,7 @@ impl RendererBuilder {
             heading: None,
             rule: None,
             footnote_ref: None,
+            table: None,
         }
     }
 
@@ -231,6 +240,16 @@ impl RendererBuilder {
         self
     }
 
+    /// Override table rendering. Receives `(header, rows, theme)`.
+    /// When set, the default table renderer is completely replaced.
+    pub fn with_table(
+        mut self,
+        f: impl Fn(&[String], &[Vec<String>], &Theme) -> Vec<Line<'static>> + Send + Sync + 'static,
+    ) -> Self {
+        self.table = Some(Box::new(f));
+        self
+    }
+
     /// Consume the builder and produce a [`Renderer`].
     pub fn build(self) -> Renderer {
         Renderer {
@@ -242,6 +261,7 @@ impl RendererBuilder {
             heading: self.heading,
             rule: self.rule,
             footnote_ref: self.footnote_ref,
+            table: self.table,
         }
     }
 }
@@ -335,5 +355,34 @@ mod tests {
     fn builder_default_impl_same_as_new() {
         let r = RendererBuilder::default().build();
         assert!(r.link.is_none());
+    }
+
+    #[test]
+    fn builder_with_table_stores_closure() {
+        let renderer = RendererBuilder::new()
+            .with_table(|header, rows, _theme| {
+                let mut lines = Vec::new();
+                for h in header {
+                    lines.push(Line::raw(format!("H:{h}")));
+                }
+                for row in rows {
+                    for cell in row {
+                        lines.push(Line::raw(format!("C:{cell}")));
+                    }
+                }
+                lines
+            })
+            .build();
+        assert!(renderer.table.is_some());
+        let lines = renderer.table.as_ref().unwrap()(
+            &["Name".to_string(), "Age".to_string()],
+            &[vec!["Alice".to_string(), "30".to_string()]],
+            &crate::Theme::default(),
+        );
+        assert_eq!(lines.len(), 4, "should have 2 header + 2 body cells");
+        assert_eq!(lines[0].spans[0].content, "H:Name");
+        assert_eq!(lines[1].spans[0].content, "H:Age");
+        assert_eq!(lines[2].spans[0].content, "C:Alice");
+        assert_eq!(lines[3].spans[0].content, "C:30");
     }
 }
