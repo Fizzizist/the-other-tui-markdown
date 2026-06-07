@@ -64,15 +64,8 @@ pub type FootnoteRefFn = dyn Fn(&str) -> Vec<Span<'static>> + Send + Sync;
 
 /// Renders a table into a sequence of [`Line`]s.
 ///
-/// Arguments:
-/// - `header`: column header strings (plain text, already extracted from Markdown).
-/// - `rows`: body rows, each a `Vec` of plain-text cell strings.
-/// - `theme`: a reference to the [`Theme`] so the custom renderer can apply
-///   themed styles if desired.
-///
-/// Return a `Vec<Line<'static>>` representing the entire rendered table
-/// (header, separator, and all body rows). A trailing blank line is added by
-/// the caller.
+/// Receives column headers, body rows, and the active [`Theme`].
+/// A trailing blank line is added by the caller.
 pub type TableFn = dyn Fn(&[String], &[Vec<String>], &Theme) -> Vec<Line<'static>> + Send + Sync;
 
 // ── Renderer ─────────────────────────────────────────────────────────────────
@@ -247,32 +240,8 @@ impl RendererBuilder {
         self
     }
 
-    /// Override table rendering.
-    ///
-    /// The closure receives `(header, rows, theme)` where `header` is a slice
-    /// of column header strings, `rows` is a slice of body rows (each a
-    /// `Vec<String>` of cell values), and `theme` is the [`Theme`] for
-    /// styled output. It must return a `Vec<Line<'static>>` representing the
-    /// complete rendered table (header, separator, and all body rows).
-    ///
+    /// Override table rendering. Receives `(header, rows, theme)`.
     /// When set, the default table renderer is completely replaced.
-    ///
-    /// # Example - custom table with cell wrapping
-    ///
-    /// ```rust
-    /// use the_other_tui_markdown::{RendererBuilder, Theme};
-    /// use ratatui_core::text::{Line, Span};
-    /// use ratatui_core::style::Style;
-    ///
-    /// let renderer = RendererBuilder::new()
-    ///     .with_table(|header, rows, theme| {
-    ///         // Custom table rendering logic here
-    ///         let mut lines = Vec::new();
-    ///         // ... build lines from header and rows using theme styles ...
-    ///         lines
-    ///     })
-    ///     .build();
-    /// ```
     pub fn with_table(
         mut self,
         f: impl Fn(&[String], &[Vec<String>], &Theme) -> Vec<Line<'static>> + Send + Sync + 'static,
