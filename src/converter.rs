@@ -6,6 +6,7 @@ use pulldown_cmark::{
 };
 use ratatui_core::style::Style;
 use ratatui_core::text::{Line, Span, Text};
+use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
 use crate::Renderer;
@@ -17,7 +18,10 @@ use crate::Renderer;
 enum BlockCtx {
     Paragraph,
     Heading(HeadingLevel),
-    CodeBlock { lang: String, content: String },
+    CodeBlock {
+        lang: String,
+        content: String,
+    },
     BlockQuote(Option<BlockQuoteKind>),
     OrderedList(u64),
     BulletList,
@@ -76,6 +80,8 @@ struct FootnoteDef {
 
 pub(crate) struct Converter<'r> {
     renderer: &'r Renderer,
+    /// Original markdown source, stored for extracting list item numbers.
+    source: &'r str,
     /// Completed output lines.
     lines: Vec<Line<'static>>,
     /// Spans accumulating for the line currently being built.
@@ -86,6 +92,9 @@ pub(crate) struct Converter<'r> {
     inline_stack: Vec<Style>,
     /// Nesting depth of list items (for indentation).
     item_depth: usize,
+    /// Stack of original item numbers per ordered list nesting level.
+    /// Each inner vec collects the original numbers for items in that list.
+    item_numbers: Vec<Vec<u64>>,
     /// URL stashed when we enter `Tag::Link`.
     pending_link_url: Option<String>,
     /// Index into `current_spans` at which the current link's content begins.
@@ -105,11 +114,13 @@ impl<'r> Converter<'r> {
     pub(crate) fn new(renderer: &'r Renderer) -> Self {
         Self {
             renderer,
+            source: "",
             lines: Vec::new(),
             current_spans: Vec::new(),
             block_stack: Vec::new(),
             inline_stack: Vec::new(),
             item_depth: 0,
+            item_numbers: Vec::new(),
             pending_link_url: None,
             link_span_start: None,
             pending_image_alt: None,
@@ -194,6 +205,30 @@ impl<'r> Converter<'r> {
         "  ".repeat(self.item_depth.saturating_sub(1))
     }
 
+    /// Extract the original item number from the markdown source.
+    /// Scans backwards from the start of `range` to find the line start,
+    /// then parses the number before the `.` or `)` delimiter.
+    fn extract_item_number(&self, range: Option<Range<usize>>) -> Option<u64> {
+        let range = range?;
+        let src = self.source;
+        if range.start > src.len() {
+            return None;
+        }
+        let line_start = src[..range.start]
+            .rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let line_end = src[range.start..]
+            .find('\n')
+            .map(|p| range.start + p)
+            .unwrap_or(src.len());
+        let line = &src[line_start..line_end.min(src.len())];
+        let trimmed = line.trim_start();
+        let num_end = trimmed.find(['.', ')'])?;
+        let num_str = &trimmed[..num_end];
+        num_str.parse::<u64>().ok()
+    }
+
     fn push_span(&mut self, content: impl Into<String>, style: Style) {
         let content = content.into();
         if !content.is_empty() {
@@ -215,7 +250,10 @@ impl<'r> Converter<'r> {
     fn is_table_context(&self) -> bool {
         for ctx in self.block_stack.iter().rev() {
             match ctx {
-                BlockCtx::Table(_) | BlockCtx::TableHead | BlockCtx::TableRow | BlockCtx::TableCell => {
+                BlockCtx::Table(_)
+                | BlockCtx::TableHead
+                | BlockCtx::TableRow
+                | BlockCtx::TableCell => {
                     return true;
                 }
                 _ => {}
@@ -255,7 +293,12 @@ impl<'r> Converter<'r> {
 
         // Compute column widths (display width).
         let mut col_widths: Vec<usize> = (0..ncols)
-            .map(|i| buf.header.get(i).map(|h| UnicodeWidthStr::width(h.as_str())).unwrap_or(0))
+            .map(|i| {
+                buf.header
+                    .get(i)
+                    .map(|h| UnicodeWidthStr::width(h.as_str()))
+                    .unwrap_or(0)
+            })
             .collect();
         for row in &buf.rows {
             for (i, cell) in row.iter().enumerate() {
@@ -319,24 +362,21 @@ impl<'r> Converter<'r> {
     fn make_item_marker(&self) -> String {
         for ctx in self.block_stack.iter().rev() {
             match ctx {
-                BlockCtx::OrderedList(n) => return format!("{}. ", n),
+                BlockCtx::OrderedList(_) => {
+                    // Use the original source number if available
+                    if let Some(nums) = self.item_numbers.last()
+                        && let Some(&n) = nums.last()
+                    {
+                        return format!("{}. ", n);
+                    }
+                    // Fallback: shouldn't happen, but use 1 as default
+                    return "1. ".to_string();
+                }
                 BlockCtx::BulletList => return "• ".to_string(),
                 _ => {}
             }
         }
         "• ".to_string()
-    }
-
-    fn advance_list_counter(&mut self) {
-        for ctx in self.block_stack.iter_mut().rev() {
-            if let BlockCtx::OrderedList(n) = ctx {
-                *n += 1;
-                return;
-            }
-            if matches!(ctx, BlockCtx::BulletList) {
-                return;
-            }
-        }
     }
 
     // ── Footnote definitions ──────────────────────────────────────────────────
@@ -363,16 +403,11 @@ impl<'r> Converter<'r> {
             return;
         }
         self.lines.push(Line::default());
-        self.lines.push(Line::from(Span::styled(
-            "─".repeat(40),
-            self.theme().rule,
-        )));
+        self.lines
+            .push(Line::from(Span::styled("─".repeat(40), self.theme().rule)));
         let defs = std::mem::take(&mut self.footnote_defs);
         for def in &defs {
-            let label_span = Span::styled(
-                format!("[{}]: ", def.label),
-                self.theme().footnote_def,
-            );
+            let label_span = Span::styled(format!("[{}]: ", def.label), self.theme().footnote_def);
             let content_span = Span::styled(def.content.clone(), self.theme().footnote_def);
             self.lines.push(Line::from(vec![label_span, content_span]));
         }
@@ -380,7 +415,7 @@ impl<'r> Converter<'r> {
 
     // ── Main convert entry-point ──────────────────────────────────────────────
 
-    pub(crate) fn convert(&mut self, markdown: &str) -> Text<'static> {
+    pub(crate) fn convert(&mut self, markdown: &'r str) -> Text<'static> {
         let options = Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TABLES
             | Options::ENABLE_GFM
@@ -391,10 +426,11 @@ impl<'r> Converter<'r> {
             | Options::ENABLE_SUBSCRIPT
             | Options::ENABLE_DEFINITION_LIST;
 
+        self.source = markdown;
         let parser = Parser::new_ext(markdown, options);
 
-        for event in parser {
-            self.handle_event(event);
+        for (event, range) in parser.into_offset_iter() {
+            self.handle_event(event, Some(range));
         }
 
         // Flush dangling spans.
@@ -417,9 +453,9 @@ impl<'r> Converter<'r> {
 
     // ── Event dispatch ────────────────────────────────────────────────────────
 
-    fn handle_event(&mut self, event: Event<'_>) {
+    fn handle_event(&mut self, event: Event<'_>, range: Option<Range<usize>>) {
         match event {
-            Event::Start(tag) => self.handle_start(tag),
+            Event::Start(tag) => self.handle_start(tag, range),
             Event::End(tag) => self.handle_end(tag),
 
             Event::Text(text) => {
@@ -509,9 +545,7 @@ impl<'r> Converter<'r> {
                 let lines = if let Some(f) = &self.renderer.rule {
                     f()
                 } else {
-                    vec![
-                        Line::from(Span::styled("─".repeat(40), self.theme().rule)),
-                    ]
+                    vec![Line::from(Span::styled("─".repeat(40), self.theme().rule))]
                 };
                 self.lines.extend(lines);
                 self.lines.push(Line::default());
@@ -554,7 +588,6 @@ impl<'r> Converter<'r> {
                     self.current_spans.push(span);
                 }
             }
-
         }
     }
 
@@ -580,7 +613,7 @@ impl<'r> Converter<'r> {
 
     // ── Start tag handling ────────────────────────────────────────────────────
 
-    fn handle_start(&mut self, tag: Tag<'_>) {
+    fn handle_start(&mut self, tag: Tag<'_>, range: Option<Range<usize>>) {
         match tag {
             Tag::Paragraph => {
                 self.block_stack.push(BlockCtx::Paragraph);
@@ -623,17 +656,46 @@ impl<'r> Converter<'r> {
                 } else {
                     BlockCtx::BulletList
                 };
+                if matches!(ctx, BlockCtx::OrderedList(_)) {
+                    self.item_numbers.push(Vec::new());
+                }
                 self.block_stack.push(ctx);
             }
 
             Tag::Item => {
                 self.item_depth += 1;
                 self.block_stack.push(BlockCtx::Item);
+                // For ordered lists, extract the original item number from source
+                let is_ordered = self
+                    .block_stack
+                    .iter()
+                    .rev()
+                    .any(|ctx| matches!(ctx, BlockCtx::OrderedList(_)));
+                if is_ordered {
+                    if let Some(num) = self.extract_item_number(range) {
+                        if let Some(nums) = self.item_numbers.last_mut() {
+                            nums.push(num);
+                        }
+                    } else {
+                        // Fallback: use counter from BlockCtx
+                        let counter = self.block_stack.iter().rev().find_map(|ctx| {
+                            if let BlockCtx::OrderedList(n) = ctx {
+                                Some(*n)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(n) = counter
+                            && let Some(nums) = self.item_numbers.last_mut()
+                        {
+                                nums.push(n);
+                        }
+                    }
+                }
                 let indent = self.list_indent();
                 let marker = self.make_item_marker();
                 let style = self.theme().list_marker;
                 self.push_span(format!("{}{}", indent, marker), style);
-                self.advance_list_counter();
             }
 
             Tag::Table(_) => {
@@ -752,7 +814,16 @@ impl<'r> Converter<'r> {
             }
 
             TagEnd::List(_) => {
+                // Pop item_numbers if the closing list was ordered
+                let was_ordered = self
+                    .block_stack
+                    .iter()
+                    .rev()
+                    .any(|ctx| matches!(ctx, BlockCtx::OrderedList(_)));
                 self.block_stack.pop();
+                if was_ordered {
+                    self.item_numbers.pop();
+                }
                 // Blank line after the outermost list.
                 if !self.block_stack.iter().any(|b| matches!(b, BlockCtx::Item)) {
                     self.lines.push(Line::default());
@@ -1034,10 +1105,7 @@ mod tests {
     fn h1_uses_bold() {
         let text = convert("# Bold heading");
         let spans = all_spans(&text);
-        let heading: Vec<_> = spans
-            .iter()
-            .filter(|(c, _)| c == "Bold heading")
-            .collect();
+        let heading: Vec<_> = spans.iter().filter(|(c, _)| c == "Bold heading").collect();
         assert!(!heading.is_empty());
         for (_, style) in heading {
             assert!(style.add_modifier.contains(Modifier::BOLD));
@@ -1129,9 +1197,7 @@ mod tests {
     #[test]
     fn inline_code_custom_renderer() {
         let renderer = RendererBuilder::new()
-            .with_inline_code(|code| {
-                vec![Span::raw(format!("`{code}`"))]
-            })
+            .with_inline_code(|code| vec![Span::raw(format!("`{code}`"))])
             .build();
         let text = convert_with("Use `foo` here.", &renderer);
         let p = plain_text(&text);
@@ -1156,9 +1222,7 @@ mod tests {
     #[test]
     fn fenced_code_block_custom_renderer() {
         let renderer = RendererBuilder::new()
-            .with_code_block(|lang, content| {
-                vec![Line::raw(format!("LANG={lang} CODE={content}"))]
-            })
+            .with_code_block(|lang, content| vec![Line::raw(format!("LANG={lang} CODE={content}"))])
             .build();
         let p = plain_text(&convert_with("```python\npass\n```", &renderer));
         assert!(p.contains("LANG=python"), "lang not passed: {p}");
@@ -1333,10 +1397,15 @@ mod tests {
         let p = plain_text(&convert_with("[a](l1) foo [b](l2)", &renderer));
         assert!(p.contains("[a](l1)"), "first link wrong: {p}");
         assert!(p.contains("[b](l2)"), "second link wrong: {p}");
-        assert!(!p.contains("[a](l1) foo [b](l2)".replace('(', "").as_str()),
-            "alt text must not bleed across links: {p}");
+        assert!(
+            !p.contains("[a](l1) foo [b](l2)".replace('(', "").as_str()),
+            "alt text must not bleed across links: {p}"
+        );
         // Stricter: the second link's alt must be exactly "b", not "a(l1) foo b".
-        assert!(!p.contains("a(l1)"), "first link content leaked into second: {p}");
+        assert!(
+            !p.contains("a(l1)"),
+            "first link content leaked into second: {p}"
+        );
     }
 
     // ── Images ────────────────────────────────────────────────────────────────
@@ -1354,7 +1423,10 @@ mod tests {
             .with_image(|alt, url| vec![Span::raw(format!("IMAGE:{alt}@{url}"))])
             .build();
         let p = plain_text(&convert_with("![kitten](kitten.jpg)", &renderer));
-        assert!(p.contains("IMAGE:kitten@kitten.jpg"), "custom image renderer not applied: {p}");
+        assert!(
+            p.contains("IMAGE:kitten@kitten.jpg"),
+            "custom image renderer not applied: {p}"
+        );
     }
 
     // ── Tables ────────────────────────────────────────────────────────────────
@@ -1390,17 +1462,19 @@ mod tests {
     #[test]
     fn table_header_uses_bold_style() {
         let renderer = RendererBuilder::new().build();
-        let text = convert_with(
-            "| Col |\n|-----|\n| val |",
-            &renderer,
-        );
+        let text = convert_with("| Col |\n|-----|\n| val |", &renderer);
         let spans = all_spans(&text);
         let header: Vec<_> = spans.iter().filter(|(c, _)| c.trim() == "Col").collect();
-        assert!(!header.is_empty(), "header span not found, spans: {:?}", spans);
+        assert!(
+            !header.is_empty(),
+            "header span not found, spans: {:?}",
+            spans
+        );
         for (_, s) in header {
             assert!(
                 s.add_modifier.contains(Modifier::BOLD),
-                "table header should be BOLD, got {:?}", s
+                "table header should be BOLD, got {:?}",
+                s
             );
         }
     }
@@ -1427,7 +1501,10 @@ mod tests {
             .with_footnote_ref(|label| vec![Span::raw(format!("(note {label})"))])
             .build();
         let p = plain_text(&convert_with("Text[^abc].\n\n[^abc]: Content.", &renderer));
-        assert!(p.contains("(note abc)"), "custom footnote ref not applied: {p}");
+        assert!(
+            p.contains("(note abc)"),
+            "custom footnote ref not applied: {p}"
+        );
     }
 
     // ── Inline HTML ───────────────────────────────────────────────────────────
@@ -1465,7 +1542,10 @@ mod tests {
             })
             .build();
         let p = plain_text(&convert_with("# My Title", &renderer));
-        assert!(p.contains("H1: My Title"), "custom heading not applied: {p}");
+        assert!(
+            p.contains("H1: My Title"),
+            "custom heading not applied: {p}"
+        );
     }
 
     // ── Edge cases ────────────────────────────────────────────────────────────
@@ -1506,12 +1586,16 @@ mod tests {
         );
         // Parent and child must NOT share a line.
         assert!(
-            !lines.iter().any(|l| l.contains("parent") && l.contains("child")),
+            !lines
+                .iter()
+                .any(|l| l.contains("parent") && l.contains("child")),
             "parent and child on same line: {lines:?}"
         );
         // The two sibling nested items must be on different lines.
         assert!(
-            !lines.iter().any(|l| l.contains("child") && l.contains("sibling")),
+            !lines
+                .iter()
+                .any(|l| l.contains("child") && l.contains("sibling")),
             "child and sibling on same line: {lines:?}"
         );
     }
@@ -1537,16 +1621,54 @@ mod tests {
     #[test]
     fn custom_table_renderer_overrides_default() {
         let renderer = RendererBuilder::new()
-            .with_table(|_header, _rows, _theme| {
-                vec![Line::raw("CUSTOM_TABLE")]
-            })
+            .with_table(|_header, _rows, _theme| vec![Line::raw("CUSTOM_TABLE")])
             .build();
         let md = "| X | Y |\n|---|---|\n| 1 | 2 |";
         let text = convert_with(md, &renderer);
         let p = plain_text(&text);
-        assert!(p.contains("CUSTOM_TABLE"), "custom table renderer should override default: {p}");
+        assert!(
+            p.contains("CUSTOM_TABLE"),
+            "custom table renderer should override default: {p}"
+        );
         // Should NOT contain default separator characters
         assert!(!p.contains('┼'), "default separator should not appear: {p}");
     }
 
+    // ── Ordered list number preservation ───────────────────────────────────────
+
+    #[test]
+    fn ordered_list_preserves_non_sequential_numbers() {
+        let text = convert("2. test\n4. test\n8. test");
+        let p = plain_text(&text);
+        assert!(p.contains("2. "), "should contain '2. ', got: {p}");
+        assert!(p.contains("4. "), "should contain '4. ', got: {p}");
+        assert!(p.contains("8. "), "should contain '8. ', got: {p}");
+    }
+
+    #[test]
+    fn ordered_list_sequential_still_works() {
+        let text = convert("1. a\n2. b\n3. c");
+        let p = plain_text(&text);
+        assert!(p.contains("1. "), "should contain '1. ', got: {p}");
+        assert!(p.contains("2. "), "should contain '2. ', got: {p}");
+        assert!(p.contains("3. "), "should contain '3. ', got: {p}");
+    }
+
+    #[test]
+    fn nested_ordered_list_preserves_numbers() {
+        let md = "1. outer\n   2. inner\n   4. inner\n3. outer";
+        let text = convert(md);
+        let p = plain_text(&text);
+        assert!(p.contains("1. "), "outer first item, got: {p}");
+        assert!(p.contains("2. "), "inner first item, got: {p}");
+        assert!(p.contains("4. "), "inner second item, got: {p}");
+        assert!(p.contains("3. "), "outer second item, got: {p}");
+    }
+
+    #[test]
+    fn ordered_list_single_item() {
+        let text = convert("5. only");
+        let p = plain_text(&text);
+        assert!(p.contains("5. "), "single item should show '5. ', got: {p}");
+    }
 }
