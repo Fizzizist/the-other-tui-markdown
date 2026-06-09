@@ -214,10 +214,7 @@ impl<'r> Converter<'r> {
         if range.start > src.len() {
             return None;
         }
-        let line_start = src[..range.start]
-            .rfind('\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
+        let line_start = src[..range.start].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let line_end = src[range.start..]
             .find('\n')
             .map(|p| range.start + p)
@@ -363,14 +360,14 @@ impl<'r> Converter<'r> {
         for ctx in self.block_stack.iter().rev() {
             match ctx {
                 BlockCtx::OrderedList(_) => {
-                    // Use the original source number if available
-                    if let Some(nums) = self.item_numbers.last()
-                        && let Some(&n) = nums.last()
-                    {
-                        return format!("{}. ", n);
-                    }
-                    // Fallback: shouldn't happen, but use 1 as default
-                    return "1. ".to_string();
+                    let nums = self
+                        .item_numbers
+                        .last()
+                        .expect("item_numbers must exist when inside OrderedList");
+                    let n = nums
+                        .last()
+                        .expect("item_numbers entry must be non-empty when rendering an item");
+                    return format!("{}. ", n);
                 }
                 BlockCtx::BulletList => return "• ".to_string(),
                 _ => {}
@@ -688,7 +685,7 @@ impl<'r> Converter<'r> {
                         if let Some(n) = counter
                             && let Some(nums) = self.item_numbers.last_mut()
                         {
-                                nums.push(n);
+                            nums.push(n);
                         }
                     }
                 }
@@ -814,14 +811,16 @@ impl<'r> Converter<'r> {
             }
 
             TagEnd::List(_) => {
-                // Pop item_numbers if the closing list was ordered
-                let was_ordered = self
+                // Check if the list being closed is ordered before popping.
+                // Only the top of the stack tells us the type of *this* list;
+                // searching the entire stack would misidentify a nested bullet
+                // list inside an ordered list as ordered.
+                let is_ordered = self
                     .block_stack
-                    .iter()
-                    .rev()
-                    .any(|ctx| matches!(ctx, BlockCtx::OrderedList(_)));
+                    .last()
+                    .is_some_and(|ctx| matches!(ctx, BlockCtx::OrderedList(_)));
                 self.block_stack.pop();
-                if was_ordered {
+                if is_ordered {
                     self.item_numbers.pop();
                 }
                 // Blank line after the outermost list.
@@ -1670,5 +1669,30 @@ mod tests {
         let text = convert("5. only");
         let p = plain_text(&text);
         assert!(p.contains("5. "), "single item should show '5. ', got: {p}");
+    }
+
+    #[test]
+    fn bullet_list_inside_ordered_list() {
+        let md = "1. outer\n   - bullet\n2. second";
+        let text = convert(md);
+        let p = plain_text(&text);
+        assert!(p.contains("1. "), "ordered first item, got: {p}");
+        assert!(p.contains("• "), "bullet item, got: {p}");
+        assert!(p.contains("2. "), "ordered second item, got: {p}");
+        // Ensure the second ordered item is NOT "1." (the bug scenario)
+        assert!(
+            !p.contains("1. second"),
+            "second item must not regress to '1. second', got: {p}"
+        );
+    }
+
+    #[test]
+    fn ordered_list_inside_bullet_list() {
+        let md = "- bullet one\n  1. ordered inner\n  2. second inner\n- bullet two";
+        let text = convert(md);
+        let p = plain_text(&text);
+        assert!(p.contains("• "), "bullet markers, got: {p}");
+        assert!(p.contains("1. "), "first ordered inner, got: {p}");
+        assert!(p.contains("2. "), "second ordered inner, got: {p}");
     }
 }
