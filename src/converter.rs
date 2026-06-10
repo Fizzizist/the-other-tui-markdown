@@ -526,8 +526,7 @@ impl<'r> Converter<'r> {
                     self.append_to_current_footnote(" ");
                     return;
                 }
-                let style = self.current_style();
-                self.push_span(" ", style);
+                self.commit_line();
             }
 
             Event::HardBreak => {
@@ -1320,11 +1319,16 @@ mod tests {
     }
 
     #[test]
-    fn soft_break_becomes_space() {
-        let spans = all_spans(&convert("word1\nword2"));
-        let combined: String = spans.iter().map(|(c, _)| c.as_str()).collect();
-        assert!(combined.contains("word1") && combined.contains("word2"));
-        assert!(spans.iter().any(|(c, _)| c == " "));
+    fn soft_break_becomes_newline() {
+        let text = convert("word1\nword2");
+        let p = plain_text(&text);
+        assert!(p.contains("word1") && p.contains("word2"));
+        // Soft break should produce separate lines, not a space
+        assert!(
+            text.lines.len() > 1,
+            "soft break should produce multiple lines, got: {:?}",
+            text.lines.len()
+        );
     }
 
     // ── Links ─────────────────────────────────────────────────────────────────
@@ -1694,5 +1698,34 @@ mod tests {
         assert!(p.contains("• "), "bullet markers, got: {p}");
         assert!(p.contains("1. "), "first ordered inner, got: {p}");
         assert!(p.contains("2. "), "second ordered inner, got: {p}");
+    }
+
+    #[test]
+    fn paragraph_then_list_without_blank_line_renders_on_separate_lines() {
+        let md = "I'm testing something:\n2. test\n3. test\n5. test";
+        let text = convert(md);
+        let p = plain_text(&text);
+        assert!(
+            p.contains("I'm testing something"),
+            "should contain paragraph text, got: {p}"
+        );
+        assert!(
+            p.contains("2. test"),
+            "should contain first list item, got: {p}"
+        );
+        assert!(
+            p.contains("3. test"),
+            "should contain second list item, got: {p}"
+        );
+        assert!(
+            p.contains("5. test"),
+            "should contain third list item, got: {p}"
+        );
+        // Even without a blank line, soft breaks should produce separate lines
+        assert!(
+            text.lines.len() > 1,
+            "should have multiple lines, got: {}",
+            text.lines.len()
+        );
     }
 }
