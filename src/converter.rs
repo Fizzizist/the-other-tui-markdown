@@ -359,15 +359,13 @@ impl<'r> Converter<'r> {
     fn make_item_marker(&self) -> String {
         for ctx in self.block_stack.iter().rev() {
             match ctx {
-                BlockCtx::OrderedList(_) => {
-                    let nums = self
-                        .item_numbers
-                        .last()
-                        .expect("item_numbers must exist when inside OrderedList");
-                    let n = nums
-                        .last()
-                        .expect("item_numbers entry must be non-empty when rendering an item");
-                    return format!("{}. ", n);
+                BlockCtx::OrderedList(start) => {
+                    if let Some(nums) = self.item_numbers.last()
+                        && let Some(last) = nums.last()
+                    {
+                        return format!("{}. ", last);
+                    }
+                    return format!("{}. ", start);
                 }
                 BlockCtx::BulletList => return "• ".to_string(),
                 _ => {}
