@@ -64,9 +64,12 @@ pub type FootnoteRefFn = dyn Fn(&str) -> Vec<Span<'static>> + Send + Sync;
 
 /// Renders a table into a sequence of [`Line`]s.
 ///
-/// Receives column headers, body rows, and the active [`Theme`].
-/// A trailing blank line is added by the caller.
-pub type TableFn = dyn Fn(&[String], &[Vec<String>], &Theme) -> Vec<Line<'static>> + Send + Sync;
+/// Receives the header row and body rows. Each cell is a [`Vec`] of
+/// [`Span`]s carrying the inline styles already applied by the current
+/// [`Theme`]. The closure may inspect, replace, or re-wrap the spans.
+pub type TableFn = dyn Fn(&[Vec<Span<'static>>], &[Vec<Vec<Span<'static>>>], &Theme) -> Vec<Line<'static>>
+    + Send
+    + Sync;
 
 // ── Renderer ─────────────────────────────────────────────────────────────────
 
@@ -220,10 +223,7 @@ impl RendererBuilder {
     /// Override thematic-break rendering.
     ///
     /// The closure takes no arguments and must return a `Vec<Line<'static>>`.
-    pub fn with_rule(
-        mut self,
-        f: impl Fn() -> Vec<Line<'static>> + Send + Sync + 'static,
-    ) -> Self {
+    pub fn with_rule(mut self, f: impl Fn() -> Vec<Line<'static>> + Send + Sync + 'static) -> Self {
         self.rule = Some(Box::new(f));
         self
     }
@@ -241,10 +241,16 @@ impl RendererBuilder {
     }
 
     /// Override table rendering. Receives `(header, rows, theme)`.
-    /// When set, the default table renderer is completely replaced.
+    ///
+    /// `header` and each row are `Vec`s of cells; each cell is a `Vec` of
+    /// [`Span`]s with inline styles already applied. The default renderer pads
+    /// each cell to the computed column width and joins columns with ` │ `.
     pub fn with_table(
         mut self,
-        f: impl Fn(&[String], &[Vec<String>], &Theme) -> Vec<Line<'static>> + Send + Sync + 'static,
+        f: impl Fn(&[Vec<Span<'static>>], &[Vec<Vec<Span<'static>>>], &Theme) -> Vec<Line<'static>>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.table = Some(Box::new(f));
         self
@@ -315,9 +321,7 @@ mod tests {
     #[test]
     fn builder_with_code_block_stores_closure() {
         let r = RendererBuilder::new()
-            .with_code_block(|lang, content| {
-                vec![Line::raw(format!("{lang}: {content}"))]
-            })
+            .with_code_block(|lang, content| vec![Line::raw(format!("{lang}: {content}"))])
             .build();
         let lines = r.code_block.as_ref().unwrap()("rust", "fn main() {}");
         assert_eq!(lines[0].spans[0].content, "rust: fn main() {}");
@@ -363,22 +367,23 @@ mod tests {
             .with_table(|header, rows, _theme| {
                 let mut lines = Vec::new();
                 for h in header {
-                    lines.push(Line::raw(format!("H:{h}")));
+                    let content: String = h.iter().map(|s| s.content.as_ref()).collect();
+                    lines.push(Line::raw(format!("H:{content}")));
                 }
                 for row in rows {
                     for cell in row {
-                        lines.push(Line::raw(format!("C:{cell}")));
+                        let content: String = cell.iter().map(|s| s.content.as_ref()).collect();
+                        lines.push(Line::raw(format!("C:{content}")));
                     }
                 }
                 lines
             })
             .build();
         assert!(renderer.table.is_some());
-        let lines = renderer.table.as_ref().unwrap()(
-            &["Name".to_string(), "Age".to_string()],
-            &[vec!["Alice".to_string(), "30".to_string()]],
-            &crate::Theme::default(),
-        );
+        let header: Vec<Vec<Span<'static>>> = vec![vec![Span::raw("Name")], vec![Span::raw("Age")]];
+        let rows: Vec<Vec<Vec<Span<'static>>>> =
+            vec![vec![vec![Span::raw("Alice")], vec![Span::raw("30")]]];
+        let lines = renderer.table.as_ref().unwrap()(&header, &rows, &crate::Theme::default());
         assert_eq!(lines.len(), 4, "should have 2 header + 2 body cells");
         assert_eq!(lines[0].spans[0].content, "H:Name");
         assert_eq!(lines[1].spans[0].content, "H:Age");

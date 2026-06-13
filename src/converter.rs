@@ -17,7 +17,10 @@ use crate::Renderer;
 enum BlockCtx {
     Paragraph,
     Heading(HeadingLevel),
-    CodeBlock { lang: String, content: String },
+    CodeBlock {
+        lang: String,
+        content: String,
+    },
     BlockQuote(Option<BlockQuoteKind>),
     OrderedList(u64),
     BulletList,
@@ -40,16 +43,16 @@ enum BlockCtx {
 /// A fully-buffered table (all rows collected before rendering).
 #[derive(Debug, Clone)]
 struct TableBuf {
-    /// Header cells (plain strings).
-    header: Vec<String>,
-    /// Body rows, each a Vec of plain strings.
-    rows: Vec<Vec<String>>,
+    /// Header cells, each a `Vec<Span>` holding styled inline content.
+    header: Vec<Vec<Span<'static>>>,
+    /// Body rows, each a Vec of cells, each cell a Vec of styled spans.
+    rows: Vec<Vec<Vec<Span<'static>>>>,
     /// Current cell being accumulated.
-    current_cell: String,
+    current_cell: Vec<Span<'static>>,
     /// Whether we are currently in the header section.
     in_header: bool,
     /// Current partial row being accumulated.
-    current_row: Vec<String>,
+    current_row: Vec<Vec<Span<'static>>>,
 }
 
 impl TableBuf {
@@ -57,7 +60,7 @@ impl TableBuf {
         Self {
             header: Vec::new(),
             rows: Vec::new(),
-            current_cell: String::new(),
+            current_cell: Vec::new(),
             in_header: false,
             current_row: Vec::new(),
         }
@@ -215,7 +218,10 @@ impl<'r> Converter<'r> {
     fn is_table_context(&self) -> bool {
         for ctx in self.block_stack.iter().rev() {
             match ctx {
-                BlockCtx::Table(_) | BlockCtx::TableHead | BlockCtx::TableRow | BlockCtx::TableCell => {
+                BlockCtx::Table(_)
+                | BlockCtx::TableHead
+                | BlockCtx::TableRow
+                | BlockCtx::TableCell => {
                     return true;
                 }
                 _ => {}
@@ -231,17 +237,23 @@ impl<'r> Converter<'r> {
             .map_or(false, |b| matches!(b, BlockCtx::MetadataBlock))
     }
 
-    /// If inside a table cell, append text to the current cell buffer.
-    fn try_append_table_cell_text(&mut self, s: &str) {
+    fn push_table_cell_span(&mut self, span: Span<'static>) {
         for ctx in self.block_stack.iter_mut().rev() {
             if let BlockCtx::Table(buf) = ctx {
-                buf.current_cell.push_str(s);
+                buf.current_cell.push(span);
                 return;
             }
         }
     }
 
     // ── Table rendering ───────────────────────────────────────────────────────
+
+    /// Sum display widths of spans in a cell.
+    fn cell_width(cell: &[Span<'static>]) -> usize {
+        cell.iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum()
+    }
 
     fn render_table(buf: &TableBuf, theme: &crate::Theme) -> Vec<Line<'static>> {
         let ncols = buf
@@ -255,12 +267,12 @@ impl<'r> Converter<'r> {
 
         // Compute column widths (display width).
         let mut col_widths: Vec<usize> = (0..ncols)
-            .map(|i| buf.header.get(i).map(|h| UnicodeWidthStr::width(h.as_str())).unwrap_or(0))
+            .map(|i| buf.header.get(i).map(|h| Self::cell_width(h)).unwrap_or(0))
             .collect();
         for row in &buf.rows {
             for (i, cell) in row.iter().enumerate() {
                 if i < ncols {
-                    col_widths[i] = col_widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+                    col_widths[i] = col_widths[i].max(Self::cell_width(cell));
                 }
             }
         }
@@ -273,16 +285,19 @@ impl<'r> Converter<'r> {
 
         // Header row.
         {
-            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut line_spans: Vec<Span<'static>> = Vec::new();
             for (i, w) in col_widths.iter().enumerate() {
                 if i > 0 {
-                    spans.push(Span::styled(" │ ", theme.table_separator));
+                    line_spans.push(Span::styled(" │ ", theme.table_separator));
                 }
-                let cell = buf.header.get(i).map(|s| s.as_str()).unwrap_or("");
-                let padded = pad_cell(cell, *w);
-                spans.push(Span::styled(padded, theme.table_header));
+                let cell = buf.header.get(i).map(Vec::as_slice).unwrap_or_default();
+                let mut padded = Self::pad_cell_line(cell, *w);
+                for span in &mut padded {
+                    span.style = span.style.patch(theme.table_header);
+                }
+                line_spans.extend(padded);
             }
-            out.push(Line::from(spans));
+            out.push(Line::from(line_spans));
         }
 
         // Separator row: ─────┼───── for each column.
@@ -299,18 +314,35 @@ impl<'r> Converter<'r> {
 
         // Body rows.
         for row in &buf.rows {
-            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut line_spans: Vec<Span<'static>> = Vec::new();
             for (i, w) in col_widths.iter().enumerate() {
                 if i > 0 {
-                    spans.push(Span::styled(" │ ", theme.table_separator));
+                    line_spans.push(Span::styled(" │ ", theme.table_separator));
                 }
-                let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-                let padded = pad_cell(cell, *w);
-                spans.push(Span::styled(padded, theme.table_cell));
+                let cell = row.get(i).map(Vec::as_slice).unwrap_or_default();
+                let mut padded = Self::pad_cell_line(cell, *w);
+                for span in &mut padded {
+                    span.style = span.style.patch(theme.table_cell);
+                }
+                line_spans.extend(padded);
             }
-            out.push(Line::from(spans));
+            out.push(Line::from(line_spans));
         }
 
+        out
+    }
+
+    /// Pad a cell (a sequence of spans) to `width` display width by appending a
+    /// base-styled whitespace span. Returns a fresh `Line` of spans.
+    fn pad_cell_line(cell: &[Span<'static>], width: usize) -> Vec<Span<'static>> {
+        let mut out: Vec<Span<'static>> = cell.to_vec();
+        let cell_w: usize = out
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        if cell_w < width {
+            out.push(Span::styled(" ".repeat(width - cell_w), Style::default()));
+        }
         out
     }
 
@@ -363,16 +395,11 @@ impl<'r> Converter<'r> {
             return;
         }
         self.lines.push(Line::default());
-        self.lines.push(Line::from(Span::styled(
-            "─".repeat(40),
-            self.theme().rule,
-        )));
+        self.lines
+            .push(Line::from(Span::styled("─".repeat(40), self.theme().rule)));
         let defs = std::mem::take(&mut self.footnote_defs);
         for def in &defs {
-            let label_span = Span::styled(
-                format!("[{}]: ", def.label),
-                self.theme().footnote_def,
-            );
+            let label_span = Span::styled(format!("[{}]: ", def.label), self.theme().footnote_def);
             let content_span = Span::styled(def.content.clone(), self.theme().footnote_def);
             self.lines.push(Line::from(vec![label_span, content_span]));
         }
@@ -434,9 +461,10 @@ impl<'r> Converter<'r> {
                     }
                     return;
                 }
-                // Inside a table cell: buffer the text.
+                // Inside a table cell: push a styled span into the cell buffer.
                 if self.is_table_context() {
-                    self.try_append_table_cell_text(&s);
+                    let span = Span::styled(s, self.current_style());
+                    self.push_table_cell_span(span);
                     return;
                 }
                 // Inside a footnote def: buffer content.
@@ -461,17 +489,22 @@ impl<'r> Converter<'r> {
             }
 
             Event::Code(code) => {
-                if self.is_metadata() || self.is_table_context() {
+                if self.is_metadata() {
                     return;
                 }
                 let code_str = code.into_string();
-                // Custom inline_code renderer?
                 let spans = if let Some(f) = &self.renderer.inline_code {
                     f(&code_str)
                 } else {
                     let style = self.current_style().patch(self.theme().inline_code);
                     vec![Span::styled(code_str, style)]
                 };
+                if self.is_table_context() {
+                    for span in spans {
+                        self.push_table_cell_span(span);
+                    }
+                    return;
+                }
                 for span in spans {
                     self.current_spans.push(span);
                 }
@@ -482,11 +515,21 @@ impl<'r> Converter<'r> {
                     return;
                 }
                 let style = self.current_style().patch(self.theme().math);
-                self.push_span(math.into_string(), style);
+                let span = Span::styled(math.into_string(), style);
+                if self.is_table_context() {
+                    self.push_table_cell_span(span);
+                    return;
+                }
+                self.push_span(span.content, span.style);
             }
 
             Event::SoftBreak => {
-                if self.is_metadata() || self.in_image || self.is_table_context() {
+                if self.is_metadata() || self.in_image {
+                    return;
+                }
+                if self.is_table_context() {
+                    let span = Span::styled(" ".to_string(), self.current_style());
+                    self.push_table_cell_span(span);
                     return;
                 }
                 if self.current_footnote_def_label().is_some() {
@@ -498,7 +541,12 @@ impl<'r> Converter<'r> {
             }
 
             Event::HardBreak => {
-                if self.is_metadata() || self.in_image || self.is_table_context() {
+                if self.is_metadata() || self.in_image {
+                    return;
+                }
+                if self.is_table_context() {
+                    let span = Span::styled(" ".to_string(), self.current_style());
+                    self.push_table_cell_span(span);
                     return;
                 }
                 self.commit_line();
@@ -509,9 +557,7 @@ impl<'r> Converter<'r> {
                 let lines = if let Some(f) = &self.renderer.rule {
                     f()
                 } else {
-                    vec![
-                        Line::from(Span::styled("─".repeat(40), self.theme().rule)),
-                    ]
+                    vec![Line::from(Span::styled("─".repeat(40), self.theme().rule))]
                 };
                 self.lines.extend(lines);
                 self.lines.push(Line::default());
@@ -525,8 +571,13 @@ impl<'r> Converter<'r> {
                 let s = html.into_string();
                 let mut iter = s.split('\n').peekable();
                 while let Some(line) = iter.next() {
-                    self.push_span(line.trim_end_matches('\r'), style);
-                    if iter.peek().is_some() {
+                    let span = Span::styled(line.trim_end_matches('\r').to_string(), style);
+                    if self.is_table_context() {
+                        self.push_table_cell_span(span);
+                    } else {
+                        self.push_span(span.content, span.style);
+                    }
+                    if iter.peek().is_some() && !self.is_table_context() {
                         self.commit_line();
                     }
                 }
@@ -537,6 +588,11 @@ impl<'r> Converter<'r> {
                     return;
                 }
                 let marker = if checked { "[x] " } else { "[ ] " };
+                if self.is_table_context() {
+                    let span = Span::styled(marker.to_string(), self.current_style());
+                    self.push_table_cell_span(span);
+                    return;
+                }
                 self.push_span(marker, self.current_style());
             }
 
@@ -550,11 +606,16 @@ impl<'r> Converter<'r> {
                         self.theme().footnote_ref,
                     )]
                 };
+                if self.is_table_context() {
+                    for span in spans {
+                        self.push_table_cell_span(span);
+                    }
+                    return;
+                }
                 for span in spans {
                     self.current_spans.push(span);
                 }
             }
-
         }
     }
 
@@ -860,18 +921,37 @@ impl<'r> Converter<'r> {
             TagEnd::Link => {
                 self.inline_stack.pop();
                 let url = self.pending_link_url.take().unwrap_or_default();
-                // Collect the alt-text spans pushed to current_spans since
-                // Tag::Link opened (not spans from earlier in the same line).
+                if self.is_table_context() {
+                    let link_style = self.theme().link;
+                    for ctx in self.block_stack.iter_mut().rev() {
+                        if let BlockCtx::Table(buf) = ctx {
+                            let alt: String = buf
+                                .current_cell
+                                .iter()
+                                .map(|s| s.content.as_ref())
+                                .collect();
+                            if let Some(f) = &self.renderer.link {
+                                let new_spans = f(&alt, &url);
+                                buf.current_cell.clear();
+                                buf.current_cell.extend(new_spans);
+                            } else {
+                                buf.current_cell
+                                    .push(Span::styled(format!("({})", url), link_style));
+                            }
+                            break;
+                        }
+                    }
+                    return;
+                }
+                // Non-table path.
                 if let Some(f) = &self.renderer.link {
                     let start = self.link_span_start.take().unwrap_or(0);
-                    // Drain only the spans belonging to this link.
-                    let link_spans: Vec<_> = self.current_spans.drain(start..).collect();
-                    let alt: String = link_spans.iter().map(|s| s.content.as_ref()).collect();
+                    let drained: Vec<_> = self.current_spans.drain(start..).collect();
+                    let alt: String = drained.iter().map(|s| s.content.as_ref()).collect();
                     let new_spans = f(&alt, &url);
                     self.current_spans.extend(new_spans);
                 } else {
                     self.link_span_start = None;
-                    // Default: append `(url)` after the alt text spans.
                     let style = self.theme().link;
                     self.push_span(format!("({})", url), style);
                 }
@@ -887,8 +967,14 @@ impl<'r> Converter<'r> {
                     let style = self.theme().image;
                     vec![Span::styled(format!("🖼 {}({})", alt, url), style)]
                 };
-                for span in spans {
-                    self.current_spans.push(span);
+                if self.is_table_context() {
+                    for span in spans {
+                        self.push_table_cell_span(span);
+                    }
+                } else {
+                    for span in spans {
+                        self.current_spans.push(span);
+                    }
                 }
             }
         }
@@ -897,18 +983,17 @@ impl<'r> Converter<'r> {
     // ── Table cell/row helpers ────────────────────────────────────────────────
 
     /// Drain the `current_cell` buffer from the innermost Table context.
-    fn flush_table_cell(&mut self) -> String {
+    fn flush_table_cell(&mut self) -> Vec<Span<'static>> {
         for ctx in self.block_stack.iter_mut().rev() {
             if let BlockCtx::Table(buf) = ctx {
-                let cell = std::mem::take(&mut buf.current_cell);
-                return cell;
+                return std::mem::take(&mut buf.current_cell);
             }
         }
-        String::new()
+        Vec::new()
     }
 
     /// Drain the `current_row` buffer from the innermost Table context.
-    fn flush_table_row(&mut self) -> Vec<String> {
+    fn flush_table_row(&mut self) -> Vec<Vec<Span<'static>>> {
         for ctx in self.block_stack.iter_mut().rev() {
             if let BlockCtx::Table(buf) = ctx {
                 return std::mem::take(&mut buf.current_row);
@@ -942,18 +1027,6 @@ impl<'r> Converter<'r> {
             out.push(Line::from(Span::styled(line.to_owned(), theme.code_block)));
         }
         out
-    }
-}
-
-// ── Padding helper ────────────────────────────────────────────────────────────
-
-/// Pad `s` with trailing spaces until its display width equals `width`.
-fn pad_cell(s: &str, width: usize) -> String {
-    let display_w = UnicodeWidthStr::width(s);
-    if display_w < width {
-        format!("{}{}", s, " ".repeat(width - display_w))
-    } else {
-        s.to_owned()
     }
 }
 
@@ -1034,10 +1107,7 @@ mod tests {
     fn h1_uses_bold() {
         let text = convert("# Bold heading");
         let spans = all_spans(&text);
-        let heading: Vec<_> = spans
-            .iter()
-            .filter(|(c, _)| c == "Bold heading")
-            .collect();
+        let heading: Vec<_> = spans.iter().filter(|(c, _)| c == "Bold heading").collect();
         assert!(!heading.is_empty());
         for (_, style) in heading {
             assert!(style.add_modifier.contains(Modifier::BOLD));
@@ -1129,9 +1199,7 @@ mod tests {
     #[test]
     fn inline_code_custom_renderer() {
         let renderer = RendererBuilder::new()
-            .with_inline_code(|code| {
-                vec![Span::raw(format!("`{code}`"))]
-            })
+            .with_inline_code(|code| vec![Span::raw(format!("`{code}`"))])
             .build();
         let text = convert_with("Use `foo` here.", &renderer);
         let p = plain_text(&text);
@@ -1156,9 +1224,7 @@ mod tests {
     #[test]
     fn fenced_code_block_custom_renderer() {
         let renderer = RendererBuilder::new()
-            .with_code_block(|lang, content| {
-                vec![Line::raw(format!("LANG={lang} CODE={content}"))]
-            })
+            .with_code_block(|lang, content| vec![Line::raw(format!("LANG={lang} CODE={content}"))])
             .build();
         let p = plain_text(&convert_with("```python\npass\n```", &renderer));
         assert!(p.contains("LANG=python"), "lang not passed: {p}");
@@ -1333,10 +1399,15 @@ mod tests {
         let p = plain_text(&convert_with("[a](l1) foo [b](l2)", &renderer));
         assert!(p.contains("[a](l1)"), "first link wrong: {p}");
         assert!(p.contains("[b](l2)"), "second link wrong: {p}");
-        assert!(!p.contains("[a](l1) foo [b](l2)".replace('(', "").as_str()),
-            "alt text must not bleed across links: {p}");
+        assert!(
+            !p.contains("[a](l1) foo [b](l2)".replace('(', "").as_str()),
+            "alt text must not bleed across links: {p}"
+        );
         // Stricter: the second link's alt must be exactly "b", not "a(l1) foo b".
-        assert!(!p.contains("a(l1)"), "first link content leaked into second: {p}");
+        assert!(
+            !p.contains("a(l1)"),
+            "first link content leaked into second: {p}"
+        );
     }
 
     // ── Images ────────────────────────────────────────────────────────────────
@@ -1354,7 +1425,10 @@ mod tests {
             .with_image(|alt, url| vec![Span::raw(format!("IMAGE:{alt}@{url}"))])
             .build();
         let p = plain_text(&convert_with("![kitten](kitten.jpg)", &renderer));
-        assert!(p.contains("IMAGE:kitten@kitten.jpg"), "custom image renderer not applied: {p}");
+        assert!(
+            p.contains("IMAGE:kitten@kitten.jpg"),
+            "custom image renderer not applied: {p}"
+        );
     }
 
     // ── Tables ────────────────────────────────────────────────────────────────
@@ -1390,19 +1464,143 @@ mod tests {
     #[test]
     fn table_header_uses_bold_style() {
         let renderer = RendererBuilder::new().build();
-        let text = convert_with(
-            "| Col |\n|-----|\n| val |",
-            &renderer,
-        );
+        let text = convert_with("| Col |\n|-----|\n| val |", &renderer);
         let spans = all_spans(&text);
+        // The padded "Col" span plus padding spaces share the header style.
         let header: Vec<_> = spans.iter().filter(|(c, _)| c.trim() == "Col").collect();
-        assert!(!header.is_empty(), "header span not found, spans: {:?}", spans);
+        assert!(
+            !header.is_empty(),
+            "header span not found, spans: {:?}",
+            spans
+        );
         for (_, s) in header {
             assert!(
                 s.add_modifier.contains(Modifier::BOLD),
-                "table header should be BOLD, got {:?}", s
+                "table header should be BOLD, got {:?}",
+                s
             );
         }
+    }
+
+    #[test]
+    fn table_cell_inline_code_in_header_and_body() {
+        let renderer = RendererBuilder::new().build();
+        let md = "| `cmd` | Name |\n|-------|------|\n| `x` | value |";
+        let text = convert_with(md, &renderer);
+        let spans = all_spans(&text);
+
+        let code_spans: Vec<_> = spans
+            .iter()
+            .filter(|(c, _)| c == "cmd" || c == "x")
+            .collect();
+        assert!(
+            !code_spans.is_empty(),
+            "inline code spans missing, got {:?}",
+            spans
+        );
+        for (_, s) in &code_spans {
+            assert_eq!(s.fg, renderer.theme().inline_code.fg, "code span fg wrong");
+        }
+    }
+
+    #[test]
+    fn table_cell_bold_and_italic() {
+        let renderer = RendererBuilder::new().build();
+        let md = "| Text |\n|------|\n| **bold** _italic_ |";
+        let text = convert_with(md, &renderer);
+        let spans = all_spans(&text);
+
+        let bold: Vec<_> = spans.iter().filter(|(c, _)| c == "bold").collect();
+        assert!(!bold.is_empty(), "bold span missing");
+        for (_, s) in &bold {
+            assert!(s.add_modifier.contains(Modifier::BOLD));
+        }
+
+        let italic: Vec<_> = spans.iter().filter(|(c, _)| c == "italic").collect();
+        assert!(!italic.is_empty(), "italic span missing");
+        for (_, s) in &italic {
+            assert!(s.add_modifier.contains(Modifier::ITALIC));
+        }
+    }
+
+    #[test]
+    fn table_cell_link_default() {
+        let text = convert("| A |\n|---|\n| [click](https://example.com) |");
+        let p = plain_text(&text);
+        assert!(p.contains("click"), "link alt missing: {p}");
+        assert!(p.contains("https://example.com"), "link url missing: {p}");
+    }
+
+    #[test]
+    fn table_cell_link_custom_renderer_receives_spans() {
+        use std::cell::RefCell;
+        thread_local! {
+            static CAPTURED: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        }
+        CAPTURED.with(|c| c.borrow_mut().clear());
+        let renderer = RendererBuilder::new()
+            .with_link(|alt, url| {
+                CAPTURED.with(|c| c.borrow_mut().push(format!("{alt}@{url}")));
+                vec![Span::raw(format!("[{alt}]({url})"))]
+            })
+            .build();
+        let text = convert_with("| A |\n|---|\n| [x](u) |", &renderer);
+        let p = plain_text(&text);
+        assert!(p.contains("[x](u)"), "custom link not rendered: {p}");
+        CAPTURED.with(|c| {
+            assert!(
+                c.borrow().iter().any(|s| s == "x@u"),
+                "custom link not invoked"
+            );
+        });
+    }
+
+    #[test]
+    fn table_cell_image_default() {
+        let text = convert("| A |\n|---|\n| ![cat](cat.png) |");
+        let p = plain_text(&text);
+        assert!(p.contains("cat"), "image alt missing: {p}");
+        assert!(p.contains("cat.png"), "image url missing: {p}");
+    }
+
+    #[test]
+    fn table_cell_width_with_inline_code() {
+        let renderer = RendererBuilder::new().build();
+        let md = "| `abc` |\n|-------|\n| x |";
+        let text = convert_with(md, &renderer);
+        let plain = plain_text(&text);
+        // Separator line for a single-column table has only ─ characters.
+        let sep_line = text
+            .lines
+            .iter()
+            .find(|l| {
+                !l.spans.is_empty() && l.spans.iter().all(|s| s.content.chars().all(|c| c == '─'))
+            })
+            .expect("separator line");
+        let sep_text: String = sep_line.spans.iter().map(|s| s.content.as_ref()).collect();
+        // The code cell separator should be at least 3 chars of ─.
+        assert!(sep_text.len() >= 3, "separator too short: {sep_text}");
+        assert!(plain.contains("abc"), "code content missing: {plain}");
+    }
+
+    #[test]
+    fn table_custom_renderer_receives_styled_spans() {
+        let renderer = RendererBuilder::new()
+            .with_table(|header, rows, _theme| {
+                assert!(!header.is_empty());
+                // Inspect the first header cell: it should contain the inline
+                // spans accumulated while parsing the cell.
+                let first_cell = &header[0];
+                assert!(!first_cell.is_empty());
+                // The combined content should be "Name".
+                let content: String = first_cell.iter().map(|s| s.content.as_ref()).collect();
+                assert_eq!(content, "Name");
+                // One row should be present.
+                assert_eq!(rows.len(), 1);
+                vec![Line::raw(format!("ROWS={}", rows.len()))]
+            })
+            .build();
+        let _text = convert_with("| Name |\n|------|\n| Alice |", &renderer);
     }
 
     // ── Footnotes ─────────────────────────────────────────────────────────────
@@ -1427,7 +1625,10 @@ mod tests {
             .with_footnote_ref(|label| vec![Span::raw(format!("(note {label})"))])
             .build();
         let p = plain_text(&convert_with("Text[^abc].\n\n[^abc]: Content.", &renderer));
-        assert!(p.contains("(note abc)"), "custom footnote ref not applied: {p}");
+        assert!(
+            p.contains("(note abc)"),
+            "custom footnote ref not applied: {p}"
+        );
     }
 
     // ── Inline HTML ───────────────────────────────────────────────────────────
@@ -1465,7 +1666,10 @@ mod tests {
             })
             .build();
         let p = plain_text(&convert_with("# My Title", &renderer));
-        assert!(p.contains("H1: My Title"), "custom heading not applied: {p}");
+        assert!(
+            p.contains("H1: My Title"),
+            "custom heading not applied: {p}"
+        );
     }
 
     // ── Edge cases ────────────────────────────────────────────────────────────
@@ -1506,12 +1710,16 @@ mod tests {
         );
         // Parent and child must NOT share a line.
         assert!(
-            !lines.iter().any(|l| l.contains("parent") && l.contains("child")),
+            !lines
+                .iter()
+                .any(|l| l.contains("parent") && l.contains("child")),
             "parent and child on same line: {lines:?}"
         );
         // The two sibling nested items must be on different lines.
         assert!(
-            !lines.iter().any(|l| l.contains("child") && l.contains("sibling")),
+            !lines
+                .iter()
+                .any(|l| l.contains("child") && l.contains("sibling")),
             "child and sibling on same line: {lines:?}"
         );
     }
@@ -1520,9 +1728,17 @@ mod tests {
         let renderer = RendererBuilder::new()
             .with_table(|header, rows, _theme| {
                 let mut lines = Vec::new();
-                lines.push(Line::raw(format!("HDR={}", header.join(","))));
+                let header_text: Vec<String> = header
+                    .iter()
+                    .map(|cell| cell.iter().map(|s| s.content.as_ref()).collect())
+                    .collect();
+                lines.push(Line::raw(format!("HDR={}", header_text.join(","))));
                 for row in rows {
-                    lines.push(Line::raw(format!("ROW={}", row.join(","))));
+                    let row_text: Vec<String> = row
+                        .iter()
+                        .map(|cell| cell.iter().map(|s| s.content.as_ref()).collect())
+                        .collect();
+                    lines.push(Line::raw(format!("ROW={}", row_text.join(","))));
                 }
                 lines
             })
@@ -1537,16 +1753,16 @@ mod tests {
     #[test]
     fn custom_table_renderer_overrides_default() {
         let renderer = RendererBuilder::new()
-            .with_table(|_header, _rows, _theme| {
-                vec![Line::raw("CUSTOM_TABLE")]
-            })
+            .with_table(|_header, _rows, _theme| vec![Line::raw("CUSTOM_TABLE")])
             .build();
         let md = "| X | Y |\n|---|---|\n| 1 | 2 |";
         let text = convert_with(md, &renderer);
         let p = plain_text(&text);
-        assert!(p.contains("CUSTOM_TABLE"), "custom table renderer should override default: {p}");
+        assert!(
+            p.contains("CUSTOM_TABLE"),
+            "custom table renderer should override default: {p}"
+        );
         // Should NOT contain default separator characters
         assert!(!p.contains('┼'), "default separator should not appear: {p}");
     }
-
 }
