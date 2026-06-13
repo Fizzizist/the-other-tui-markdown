@@ -49,8 +49,6 @@ struct TableBuf {
     rows: Vec<Vec<Vec<Span<'static>>>>,
     /// Current cell being accumulated.
     current_cell: Vec<Span<'static>>,
-    /// Whether we are currently in the header section.
-    in_header: bool,
     /// Current partial row being accumulated.
     current_row: Vec<Vec<Span<'static>>>,
 }
@@ -61,7 +59,6 @@ impl TableBuf {
             header: Vec::new(),
             rows: Vec::new(),
             current_cell: Vec::new(),
-            in_header: false,
             current_row: Vec::new(),
         }
     }
@@ -94,6 +91,9 @@ pub(crate) struct Converter<'r> {
     /// Index into `current_spans` at which the current link's content begins.
     /// Used to extract only the link's own spans when the link closes.
     link_span_start: Option<usize>,
+    /// Index into the active table cell at which the current link's content
+    /// begins. Used to extract only the link's own spans when the link closes.
+    table_link_span_start: Option<usize>,
     /// Alt text accumulated while inside `Tag::Image`.
     pending_image_alt: Option<String>,
     /// URL stashed when we enter `Tag::Image`.
@@ -115,6 +115,7 @@ impl<'r> Converter<'r> {
             item_depth: 0,
             pending_link_url: None,
             link_span_start: None,
+            table_link_span_start: None,
             pending_image_alt: None,
             pending_image_url: None,
             in_image: false,
@@ -214,20 +215,9 @@ impl<'r> Converter<'r> {
         self.lines.push(Line::default());
     }
 
-    /// True if the innermost block context should swallow text silently.
-    fn is_table_context(&self) -> bool {
-        for ctx in self.block_stack.iter().rev() {
-            match ctx {
-                BlockCtx::Table(_)
-                | BlockCtx::TableHead
-                | BlockCtx::TableRow
-                | BlockCtx::TableCell => {
-                    return true;
-                }
-                _ => {}
-            }
-        }
-        false
+    /// True if the innermost block context is an active table cell.
+    fn is_table_cell(&self) -> bool {
+        matches!(self.block_stack.last(), Some(BlockCtx::TableCell))
     }
 
     /// True if we're inside a block context that produces no visible output.
@@ -291,10 +281,7 @@ impl<'r> Converter<'r> {
                     line_spans.push(Span::styled(" │ ", theme.table_separator));
                 }
                 let cell = buf.header.get(i).map(Vec::as_slice).unwrap_or_default();
-                let mut padded = Self::pad_cell_line(cell, *w);
-                for span in &mut padded {
-                    span.style = span.style.patch(theme.table_header);
-                }
+                let padded = Self::pad_cell_spans(cell, *w, theme.table_header);
                 line_spans.extend(padded);
             }
             out.push(Line::from(line_spans));
@@ -320,10 +307,7 @@ impl<'r> Converter<'r> {
                     line_spans.push(Span::styled(" │ ", theme.table_separator));
                 }
                 let cell = row.get(i).map(Vec::as_slice).unwrap_or_default();
-                let mut padded = Self::pad_cell_line(cell, *w);
-                for span in &mut padded {
-                    span.style = span.style.patch(theme.table_cell);
-                }
+                let padded = Self::pad_cell_spans(cell, *w, theme.table_cell);
                 line_spans.extend(padded);
             }
             out.push(Line::from(line_spans));
@@ -333,15 +317,20 @@ impl<'r> Converter<'r> {
     }
 
     /// Pad a cell (a sequence of spans) to `width` display width by appending a
-    /// base-styled whitespace span. Returns a fresh `Line` of spans.
-    fn pad_cell_line(cell: &[Span<'static>], width: usize) -> Vec<Span<'static>> {
-        let mut out: Vec<Span<'static>> = cell.to_vec();
-        let cell_w: usize = out
+    /// whitespace span with the supplied `base` style. The base style is patched
+    /// onto every span so header cells, for example, become bold without
+    /// losing inline foreground colors.
+    fn pad_cell_spans(cell: &[Span<'static>], width: usize, base: Style) -> Vec<Span<'static>> {
+        let mut out: Vec<Span<'static>> = cell
             .iter()
-            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-            .sum();
+            .map(|s| Span {
+                content: s.content.clone(),
+                style: s.style.patch(base),
+            })
+            .collect();
+        let cell_w = Self::cell_width(&out);
         if cell_w < width {
-            out.push(Span::styled(" ".repeat(width - cell_w), Style::default()));
+            out.push(Span::styled(" ".repeat(width - cell_w), base));
         }
         out
     }
@@ -462,7 +451,7 @@ impl<'r> Converter<'r> {
                     return;
                 }
                 // Inside a table cell: push a styled span into the cell buffer.
-                if self.is_table_context() {
+                if self.is_table_cell() {
                     let span = Span::styled(s, self.current_style());
                     self.push_table_cell_span(span);
                     return;
@@ -499,7 +488,7 @@ impl<'r> Converter<'r> {
                     let style = self.current_style().patch(self.theme().inline_code);
                     vec![Span::styled(code_str, style)]
                 };
-                if self.is_table_context() {
+                if self.is_table_cell() {
                     for span in spans {
                         self.push_table_cell_span(span);
                     }
@@ -516,7 +505,7 @@ impl<'r> Converter<'r> {
                 }
                 let style = self.current_style().patch(self.theme().math);
                 let span = Span::styled(math.into_string(), style);
-                if self.is_table_context() {
+                if self.is_table_cell() {
                     self.push_table_cell_span(span);
                     return;
                 }
@@ -527,7 +516,7 @@ impl<'r> Converter<'r> {
                 if self.is_metadata() || self.in_image {
                     return;
                 }
-                if self.is_table_context() {
+                if self.is_table_cell() {
                     let span = Span::styled(" ".to_string(), self.current_style());
                     self.push_table_cell_span(span);
                     return;
@@ -544,7 +533,7 @@ impl<'r> Converter<'r> {
                 if self.is_metadata() || self.in_image {
                     return;
                 }
-                if self.is_table_context() {
+                if self.is_table_cell() {
                     let span = Span::styled(" ".to_string(), self.current_style());
                     self.push_table_cell_span(span);
                     return;
@@ -572,12 +561,12 @@ impl<'r> Converter<'r> {
                 let mut iter = s.split('\n').peekable();
                 while let Some(line) = iter.next() {
                     let span = Span::styled(line.trim_end_matches('\r').to_string(), style);
-                    if self.is_table_context() {
+                    if self.is_table_cell() {
                         self.push_table_cell_span(span);
                     } else {
                         self.push_span(span.content, span.style);
                     }
-                    if iter.peek().is_some() && !self.is_table_context() {
+                    if iter.peek().is_some() && !self.is_table_cell() {
                         self.commit_line();
                     }
                 }
@@ -588,7 +577,7 @@ impl<'r> Converter<'r> {
                     return;
                 }
                 let marker = if checked { "[x] " } else { "[ ] " };
-                if self.is_table_context() {
+                if self.is_table_cell() {
                     let span = Span::styled(marker.to_string(), self.current_style());
                     self.push_table_cell_span(span);
                     return;
@@ -606,7 +595,7 @@ impl<'r> Converter<'r> {
                         self.theme().footnote_ref,
                     )]
                 };
-                if self.is_table_context() {
+                if self.is_table_cell() {
                     for span in spans {
                         self.push_table_cell_span(span);
                     }
@@ -701,13 +690,6 @@ impl<'r> Converter<'r> {
                 self.block_stack.push(BlockCtx::Table(TableBuf::new()));
             }
             Tag::TableHead => {
-                // Mark the table buffer as being in the header.
-                for ctx in self.block_stack.iter_mut().rev() {
-                    if let BlockCtx::Table(buf) = ctx {
-                        buf.in_header = true;
-                        break;
-                    }
-                }
                 self.block_stack.push(BlockCtx::TableHead);
             }
             Tag::TableRow => {
@@ -757,6 +739,14 @@ impl<'r> Converter<'r> {
             Tag::Link { dest_url, .. } => {
                 self.pending_link_url = Some(dest_url.into_string());
                 self.link_span_start = Some(self.current_spans.len());
+                if self.is_table_cell() {
+                    for ctx in self.block_stack.iter_mut().rev() {
+                        if let BlockCtx::Table(buf) = ctx {
+                            self.table_link_span_start = Some(buf.current_cell.len());
+                            break;
+                        }
+                    }
+                }
                 self.inline_stack.push(self.theme().link);
             }
 
@@ -848,7 +838,6 @@ impl<'r> Converter<'r> {
                         if !row_cells.is_empty() {
                             buf.header = row_cells;
                         }
-                        buf.in_header = false;
                         break;
                     }
                 }
@@ -921,18 +910,23 @@ impl<'r> Converter<'r> {
             TagEnd::Link => {
                 self.inline_stack.pop();
                 let url = self.pending_link_url.take().unwrap_or_default();
-                if self.is_table_context() {
+                if self.is_table_cell() {
                     let link_style = self.theme().link;
                     for ctx in self.block_stack.iter_mut().rev() {
                         if let BlockCtx::Table(buf) = ctx {
-                            let alt: String = buf
-                                .current_cell
-                                .iter()
-                                .map(|s| s.content.as_ref())
-                                .collect();
+                            let start = self
+                                .table_link_span_start
+                                .take()
+                                .unwrap_or(buf.current_cell.len());
                             if let Some(f) = &self.renderer.link {
+                                let alt: String = buf
+                                    .current_cell
+                                    .iter()
+                                    .skip(start)
+                                    .map(|s| s.content.as_ref())
+                                    .collect();
                                 let new_spans = f(&alt, &url);
-                                buf.current_cell.clear();
+                                buf.current_cell.truncate(start);
                                 buf.current_cell.extend(new_spans);
                             } else {
                                 buf.current_cell
@@ -967,7 +961,7 @@ impl<'r> Converter<'r> {
                     let style = self.theme().image;
                     vec![Span::styled(format!("🖼 {}({})", alt, url), style)]
                 };
-                if self.is_table_context() {
+                if self.is_table_cell() {
                     for span in spans {
                         self.push_table_cell_span(span);
                     }
@@ -1532,6 +1526,16 @@ mod tests {
     }
 
     #[test]
+    fn table_cell_link_surrounded_by_text() {
+        let text = convert("| A |\n|---|\n| pre [click](https://example.com) post |");
+        let p = plain_text(&text);
+        assert!(p.contains("pre"), "pre-link text missing: {p}");
+        assert!(p.contains("click"), "link alt missing: {p}");
+        assert!(p.contains("https://example.com"), "link url missing: {p}");
+        assert!(p.contains("post"), "post-link text missing: {p}");
+    }
+
+    #[test]
     fn table_cell_link_custom_renderer_receives_spans() {
         use std::cell::RefCell;
         thread_local! {
@@ -1600,7 +1604,39 @@ mod tests {
                 vec![Line::raw(format!("ROWS={}", rows.len()))]
             })
             .build();
-        let _text = convert_with("| Name |\n|------|\n| Alice |", &renderer);
+        let text = convert_with("| Name |\n|------|\n| Alice |", &renderer);
+        let p = plain_text(&text);
+        assert!(
+            p.contains("ROWS=1"),
+            "custom table renderer output missing: {p}"
+        );
+    }
+
+    #[test]
+    fn table_cell_other_inline_elements() {
+        let renderer = RendererBuilder::new().build();
+        let md =
+            "| A | B | C | D | E |\n|---|---|---|---|---|\n| ~~s~~ | ^sup^ | ~sub~ | $x$ | [^1] |";
+        let text = convert_with(md, &renderer);
+        let p = plain_text(&text);
+        assert!(p.contains('s'), "strikethrough text missing: {p}");
+        assert!(p.contains("sup"), "superscript text missing: {p}");
+        assert!(p.contains("sub"), "subscript text missing: {p}");
+        assert!(p.contains('x'), "math text missing: {p}");
+        assert!(p.contains("[^1]"), "footnote ref missing: {p}");
+    }
+
+    #[test]
+    fn table_cell_width_with_empty_cell() {
+        let renderer = RendererBuilder::new().build();
+        let md = "| A | B |\n|---|---|\n| | x |";
+        let text = convert_with(md, &renderer);
+        // Should render without panicking; separator exists.
+        assert!(
+            text.lines
+                .iter()
+                .any(|l| { l.spans.iter().any(|s| s.content.contains('─')) })
+        );
     }
 
     // ── Footnotes ─────────────────────────────────────────────────────────────

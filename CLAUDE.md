@@ -78,3 +78,5 @@ inline/display math, definition lists, inline/block HTML, metadata blocks.
   production TUI patterns.
 - `release.toml` configures `cargo-release`: version bump happens on the
   feature branch before merging to master.
+- Soft and hard line breaks inside table cells are currently collapsed to a
+  single space because each cell is rendered as a single terminal line.
