@@ -6,6 +6,7 @@ use pulldown_cmark::{
 };
 use ratatui_core::style::Style;
 use ratatui_core::text::{Line, Span, Text};
+use std::collections::VecDeque;
 use unicode_width::UnicodeWidthStr;
 
 use crate::Renderer;
@@ -102,6 +103,9 @@ pub(crate) struct Converter<'r> {
     in_image: bool,
     /// Footnote definitions collected during the parse (rendered at the end).
     footnote_defs: Vec<FootnoteDef>,
+    orig_numbers_stack: Vec<VecDeque<u64>>,
+    preparsed: Vec<VecDeque<u64>>,
+    preparsed_consumed: Vec<usize>,
 }
 
 impl<'r> Converter<'r> {
@@ -120,6 +124,9 @@ impl<'r> Converter<'r> {
             pending_image_url: None,
             in_image: false,
             footnote_defs: Vec::new(),
+            orig_numbers_stack: Vec::new(),
+            preparsed: Vec::new(),
+            preparsed_consumed: Vec::new(),
         }
     }
 
@@ -351,7 +358,15 @@ impl<'r> Converter<'r> {
     fn advance_list_counter(&mut self) {
         for ctx in self.block_stack.iter_mut().rev() {
             if let BlockCtx::OrderedList(n) = ctx {
-                *n += 1;
+                if let Some(queue) = self.orig_numbers_stack.last_mut() {
+                    if let Some(orig) = queue.pop_front() {
+                        *n = orig;
+                    } else {
+                        *n += 1;
+                    }
+                } else {
+                    *n += 1;
+                }
                 return;
             }
             if matches!(ctx, BlockCtx::BulletList) {
@@ -394,9 +409,39 @@ impl<'r> Converter<'r> {
         }
     }
 
+    fn preparse_ordered_numbers(markdown: &str) -> Vec<VecDeque<u64>> {
+        let mut levels: Vec<VecDeque<u64>> = Vec::new();
+        for line in markdown.lines() {
+            let indent = line.len() - line.trim_start().len();
+            let depth = indent / 2;
+            let trimmed = line.trim_start();
+            let digits_end = trimmed
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(trimmed.len());
+            if digits_end == 0 {
+                continue;
+            }
+            let digits = &trimmed[..digits_end];
+            let after = &trimmed[digits_end..];
+            if after.starts_with(". ") || after.starts_with(".\t") || after == "." {
+                if let Ok(n) = digits.parse::<u64>() {
+                    while levels.len() <= depth {
+                        levels.push(VecDeque::new());
+                    }
+                    levels[depth].push_back(n);
+                }
+            }
+        }
+        levels
+    }
+
     // ── Main convert entry-point ──────────────────────────────────────────────
 
     pub(crate) fn convert(&mut self, markdown: &str) -> Text<'static> {
+        self.preparsed = Self::preparse_ordered_numbers(markdown);
+        self.preparsed_consumed = vec![0; self.preparsed.len()];
+        self.orig_numbers_stack.clear();
+
         let options = Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TABLES
             | Options::ENABLE_GFM
@@ -663,17 +708,31 @@ impl<'r> Converter<'r> {
             }
 
             Tag::List(start) => {
-                // If we're inside a list item that already has text spans,
-                // commit them as a line before starting the nested list.
                 if !self.current_spans.is_empty() {
                     self.commit_line();
                 }
-                let ctx = if let Some(n) = start {
-                    BlockCtx::OrderedList(n)
+                if let Some(n) = start {
+                    let depth = self
+                        .block_stack
+                        .iter()
+                        .filter(|b| matches!(b, BlockCtx::OrderedList(_) | BlockCtx::BulletList))
+                        .count();
+                    let mut queue = VecDeque::new();
+                    if depth < self.preparsed.len() {
+                        let consumed = self.preparsed_consumed.get(depth).copied().unwrap_or(0);
+                        let level = &self.preparsed[depth];
+                        queue = level.iter().skip(consumed).copied().collect();
+                        if let Some(c) = self.preparsed_consumed.get_mut(depth) {
+                            *c = level.len();
+                        }
+                    }
+                    queue.pop_front();
+                    self.orig_numbers_stack.push(queue);
+                    self.block_stack.push(BlockCtx::OrderedList(n));
                 } else {
-                    BlockCtx::BulletList
-                };
-                self.block_stack.push(ctx);
+                    self.orig_numbers_stack.push(VecDeque::new());
+                    self.block_stack.push(BlockCtx::BulletList);
+                }
             }
 
             Tag::Item => {
@@ -804,7 +863,7 @@ impl<'r> Converter<'r> {
 
             TagEnd::List(_) => {
                 self.block_stack.pop();
-                // Blank line after the outermost list.
+                self.orig_numbers_stack.pop();
                 if !self.block_stack.iter().any(|b| matches!(b, BlockCtx::Item)) {
                     self.lines.push(Line::default());
                 }
@@ -1800,5 +1859,54 @@ mod tests {
         );
         // Should NOT contain default separator characters
         assert!(!p.contains('┼'), "default separator should not appear: {p}");
+    }
+
+    // ── Ordered list number preservation ─────────────────────────────────────
+
+    #[test]
+    fn non_sequential_ordered_list_preserves_numbers() {
+        let md = "2. alpha\n4. beta\n8. gamma";
+        let p = plain_text(&convert(md));
+        assert!(p.contains("2. "), "expected '2. ' in: {p}");
+        assert!(p.contains("4. "), "expected '4. ' in: {p}");
+        assert!(p.contains("8. "), "expected '8. ' in: {p}");
+    }
+
+    #[test]
+    fn sequential_ordered_list_unchanged() {
+        let md = "1. first\n2. second\n3. third";
+        let p = plain_text(&convert(md));
+        assert!(p.contains("1. "), "expected '1. ' in: {p}");
+        assert!(p.contains("2. "), "expected '2. ' in: {p}");
+        assert!(p.contains("3. "), "expected '3. ' in: {p}");
+    }
+
+    #[test]
+    fn start_number_greater_than_one() {
+        let md = "5. alpha\n6. beta";
+        let p = plain_text(&convert(md));
+        assert!(p.contains("5. "), "expected '5. ' in: {p}");
+        assert!(p.contains("6. "), "expected '6. ' in: {p}");
+    }
+
+    #[test]
+    fn nested_non_sequential_ordered_lists() {
+        let md = "2. outer-a\n4. outer-b\n   3. inner-x\n   5. inner-y\n8. outer-c";
+        let p = plain_text(&convert(md));
+        assert!(p.contains("2. "), "expected '2. ' in: {p}");
+        assert!(p.contains("4. "), "expected '4. ' in: {p}");
+        assert!(p.contains("3. "), "expected '3. ' in: {p}");
+        assert!(p.contains("5. "), "expected '5. ' in: {p}");
+        assert!(p.contains("8. "), "expected '8. ' in: {p}");
+    }
+
+    #[test]
+    fn mixed_ordered_and_unordered_nesting() {
+        let md = "2. first\n4. second\n   - bullet-a\n   - bullet-b\n8. third";
+        let p = plain_text(&convert(md));
+        assert!(p.contains("2. "), "expected '2. ': {p}");
+        assert!(p.contains("4. "), "expected '4. ': {p}");
+        assert!(p.contains("• "), "expected bullet: {p}");
+        assert!(p.contains("8. "), "expected '8. ': {p}");
     }
 }

@@ -22,6 +22,12 @@ src/
 
 - `pulldown-cmark` parses Markdown into an event stream.
 - `Converter` walks events and builds `Vec<Line<'static>>`.
+- Before the main event loop, `Converter` preparses the raw Markdown to extract
+  original ordered-list item numbers (preserving non-sequential numbering like
+  `2.`, `4.`, `8.`). These are organized by indentation depth into `VecDeque`s.
+  When `Tag::List(Some(_))` is encountered, the matching preparsed queue is
+  pushed onto `orig_numbers_stack`; `advance_list_counter` pops from this
+  stack to set the next item's number.
 - `Renderer` holds the `Theme` and optional custom element renderers.
 - `Theme` maps each Markdown element to a `ratatui_core::style::Style`.
 - Table cells are buffered as `Vec<Span<'static>>` so inline styles (bold,
@@ -46,7 +52,7 @@ cargo clippy --all-targets
 cargo fmt --check
 ```
 
-- All 73 unit tests and 9 doctests currently pass.
+- All 81 unit tests and 9 doctests currently pass.
 - `cargo clippy` reports only warnings (no errors).
 - `cargo fmt` has been applied to the source tree.
 
