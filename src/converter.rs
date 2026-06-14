@@ -6,7 +6,6 @@ use pulldown_cmark::{
 };
 use ratatui_core::style::Style;
 use ratatui_core::text::{Line, Span, Text};
-use std::collections::VecDeque;
 use unicode_width::UnicodeWidthStr;
 
 use crate::Renderer;
@@ -103,9 +102,7 @@ pub(crate) struct Converter<'r> {
     in_image: bool,
     /// Footnote definitions collected during the parse (rendered at the end).
     footnote_defs: Vec<FootnoteDef>,
-    orig_numbers_stack: Vec<VecDeque<u64>>,
-    preparsed: Vec<VecDeque<u64>>,
-    preparsed_consumed: Vec<usize>,
+    markdown: String,
 }
 
 impl<'r> Converter<'r> {
@@ -124,9 +121,7 @@ impl<'r> Converter<'r> {
             pending_image_url: None,
             in_image: false,
             footnote_defs: Vec::new(),
-            orig_numbers_stack: Vec::new(),
-            preparsed: Vec::new(),
-            preparsed_consumed: Vec::new(),
+            markdown: String::new(),
         }
     }
 
@@ -355,18 +350,42 @@ impl<'r> Converter<'r> {
         "• ".to_string()
     }
 
+    fn extract_orig_list_number(&self, offset: usize) -> Option<u64> {
+        let src = &self.markdown;
+        if offset >= src.len() {
+            return None;
+        }
+        let line_start = src[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let line = src[line_start..].lines().next()?;
+        let mut trimmed = line.trim_start();
+        while let Some(rest) = trimmed.strip_prefix('>') {
+            trimmed = rest.trim_start();
+        }
+        let digits_end = trimmed
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(trimmed.len());
+        if digits_end == 0 {
+            return None;
+        }
+        let digits = &trimmed[..digits_end];
+        let after = &trimmed[digits_end..];
+        if after.starts_with(". ")
+            || after.starts_with(".\t")
+            || after == "."
+            || after.starts_with(") ")
+            || after.starts_with(")\t")
+            || after == ")"
+        {
+            digits.parse().ok()
+        } else {
+            None
+        }
+    }
+
     fn advance_list_counter(&mut self) {
         for ctx in self.block_stack.iter_mut().rev() {
             if let BlockCtx::OrderedList(n) = ctx {
-                if let Some(queue) = self.orig_numbers_stack.last_mut() {
-                    if let Some(orig) = queue.pop_front() {
-                        *n = orig;
-                    } else {
-                        *n += 1;
-                    }
-                } else {
-                    *n += 1;
-                }
+                *n += 1;
                 return;
             }
             if matches!(ctx, BlockCtx::BulletList) {
@@ -409,38 +428,10 @@ impl<'r> Converter<'r> {
         }
     }
 
-    fn preparse_ordered_numbers(markdown: &str) -> Vec<VecDeque<u64>> {
-        let mut levels: Vec<VecDeque<u64>> = Vec::new();
-        for line in markdown.lines() {
-            let indent = line.len() - line.trim_start().len();
-            let depth = indent / 2;
-            let trimmed = line.trim_start();
-            let digits_end = trimmed
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(trimmed.len());
-            if digits_end == 0 {
-                continue;
-            }
-            let digits = &trimmed[..digits_end];
-            let after = &trimmed[digits_end..];
-            if after.starts_with(". ") || after.starts_with(".\t") || after == "." {
-                if let Ok(n) = digits.parse::<u64>() {
-                    while levels.len() <= depth {
-                        levels.push(VecDeque::new());
-                    }
-                    levels[depth].push_back(n);
-                }
-            }
-        }
-        levels
-    }
-
     // ── Main convert entry-point ──────────────────────────────────────────────
 
     pub(crate) fn convert(&mut self, markdown: &str) -> Text<'static> {
-        self.preparsed = Self::preparse_ordered_numbers(markdown);
-        self.preparsed_consumed = vec![0; self.preparsed.len()];
-        self.orig_numbers_stack.clear();
+        self.markdown = markdown.to_owned();
 
         let options = Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TABLES
@@ -454,8 +445,8 @@ impl<'r> Converter<'r> {
 
         let parser = Parser::new_ext(markdown, options);
 
-        for event in parser {
-            self.handle_event(event);
+        for (event, range) in parser.into_offset_iter() {
+            self.handle_event(event, range.start);
         }
 
         // Flush dangling spans.
@@ -478,9 +469,9 @@ impl<'r> Converter<'r> {
 
     // ── Event dispatch ────────────────────────────────────────────────────────
 
-    fn handle_event(&mut self, event: Event<'_>) {
+    fn handle_event(&mut self, event: Event<'_>, offset: usize) {
         match event {
-            Event::Start(tag) => self.handle_start(tag),
+            Event::Start(tag) => self.handle_start(tag, offset),
             Event::End(tag) => self.handle_end(tag),
 
             Event::Text(text) => {
@@ -675,7 +666,7 @@ impl<'r> Converter<'r> {
 
     // ── Start tag handling ────────────────────────────────────────────────────
 
-    fn handle_start(&mut self, tag: Tag<'_>) {
+    fn handle_start(&mut self, tag: Tag<'_>, offset: usize) {
         match tag {
             Tag::Paragraph => {
                 self.block_stack.push(BlockCtx::Paragraph);
@@ -712,25 +703,8 @@ impl<'r> Converter<'r> {
                     self.commit_line();
                 }
                 if let Some(n) = start {
-                    let depth = self
-                        .block_stack
-                        .iter()
-                        .filter(|b| matches!(b, BlockCtx::OrderedList(_) | BlockCtx::BulletList))
-                        .count();
-                    let mut queue = VecDeque::new();
-                    if depth < self.preparsed.len() {
-                        let consumed = self.preparsed_consumed.get(depth).copied().unwrap_or(0);
-                        let level = &self.preparsed[depth];
-                        queue = level.iter().skip(consumed).copied().collect();
-                        if let Some(c) = self.preparsed_consumed.get_mut(depth) {
-                            *c = level.len();
-                        }
-                    }
-                    queue.pop_front();
-                    self.orig_numbers_stack.push(queue);
                     self.block_stack.push(BlockCtx::OrderedList(n));
                 } else {
-                    self.orig_numbers_stack.push(VecDeque::new());
                     self.block_stack.push(BlockCtx::BulletList);
                 }
             }
@@ -738,6 +712,20 @@ impl<'r> Converter<'r> {
             Tag::Item => {
                 self.item_depth += 1;
                 self.block_stack.push(BlockCtx::Item);
+                if self
+                    .block_stack
+                    .iter()
+                    .rev()
+                    .any(|b| matches!(b, BlockCtx::OrderedList(_)))
+                    && let Some(orig) = self.extract_orig_list_number(offset)
+                {
+                    for ctx in self.block_stack.iter_mut().rev() {
+                        if let BlockCtx::OrderedList(n) = ctx {
+                            *n = orig;
+                            break;
+                        }
+                    }
+                }
                 let indent = self.list_indent();
                 let marker = self.make_item_marker();
                 let style = self.theme().list_marker;
@@ -863,7 +851,6 @@ impl<'r> Converter<'r> {
 
             TagEnd::List(_) => {
                 self.block_stack.pop();
-                self.orig_numbers_stack.pop();
                 if !self.block_stack.iter().any(|b| matches!(b, BlockCtx::Item)) {
                     self.lines.push(Line::default());
                 }
@@ -1867,46 +1854,96 @@ mod tests {
     fn non_sequential_ordered_list_preserves_numbers() {
         let md = "2. alpha\n4. beta\n8. gamma";
         let p = plain_text(&convert(md));
-        assert!(p.contains("2. "), "expected '2. ' in: {p}");
-        assert!(p.contains("4. "), "expected '4. ' in: {p}");
-        assert!(p.contains("8. "), "expected '8. ' in: {p}");
+        assert_eq!(p, "2. alpha\n4. beta\n8. gamma");
     }
 
     #[test]
     fn sequential_ordered_list_unchanged() {
         let md = "1. first\n2. second\n3. third";
         let p = plain_text(&convert(md));
-        assert!(p.contains("1. "), "expected '1. ' in: {p}");
-        assert!(p.contains("2. "), "expected '2. ' in: {p}");
-        assert!(p.contains("3. "), "expected '3. ' in: {p}");
+        assert_eq!(p, "1. first\n2. second\n3. third");
     }
 
     #[test]
     fn start_number_greater_than_one() {
         let md = "5. alpha\n6. beta";
         let p = plain_text(&convert(md));
-        assert!(p.contains("5. "), "expected '5. ' in: {p}");
-        assert!(p.contains("6. "), "expected '6. ' in: {p}");
+        assert_eq!(p, "5. alpha\n6. beta");
     }
 
     #[test]
     fn nested_non_sequential_ordered_lists() {
         let md = "2. outer-a\n4. outer-b\n   3. inner-x\n   5. inner-y\n8. outer-c";
         let p = plain_text(&convert(md));
-        assert!(p.contains("2. "), "expected '2. ' in: {p}");
-        assert!(p.contains("4. "), "expected '4. ' in: {p}");
-        assert!(p.contains("3. "), "expected '3. ' in: {p}");
-        assert!(p.contains("5. "), "expected '5. ' in: {p}");
-        assert!(p.contains("8. "), "expected '8. ' in: {p}");
+        assert!(p.contains("2. outer-a"), "outer item 2: {p}");
+        assert!(p.contains("4. outer-b"), "outer item 4: {p}");
+        assert!(p.contains("3. inner-x"), "inner item 3: {p}");
+        assert!(p.contains("5. inner-y"), "inner item 5: {p}");
+        assert!(p.contains("8. outer-c"), "outer item 8: {p}");
+        assert!(!p.contains("3. outer"), "should not renumber: {p}");
     }
 
     #[test]
     fn mixed_ordered_and_unordered_nesting() {
         let md = "2. first\n4. second\n   - bullet-a\n   - bullet-b\n8. third";
+        let text = convert(md);
+        let lines: Vec<String> = text
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .filter(|s: &String| !s.trim().is_empty())
+            .collect();
+        assert!(lines[0].contains("2. first"), "line 0: {:?}", lines);
+        assert!(lines[1].contains("4. second"), "line 1: {:?}", lines);
+        assert!(lines[2].contains("• bullet-a"), "line 2: {:?}", lines);
+        assert!(lines[3].contains("• bullet-b"), "line 3: {:?}", lines);
+        assert!(lines[4].contains("8. third"), "line 4: {:?}", lines);
+    }
+
+    #[test]
+    fn paren_ordered_list_marker() {
+        let md = "2) alpha\n4) beta\n8) gamma";
         let p = plain_text(&convert(md));
         assert!(p.contains("2. "), "expected '2. ': {p}");
         assert!(p.contains("4. "), "expected '4. ': {p}");
-        assert!(p.contains("• "), "expected bullet: {p}");
         assert!(p.contains("8. "), "expected '8. ': {p}");
+        assert!(
+            !p.contains("3. "),
+            "sequential number should not appear: {p}"
+        );
+    }
+
+    #[test]
+    fn ordered_list_after_code_block() {
+        let md =
+            "```\n10. not a list\n20. still not a list\n```\n\n2. real\n4. also real\n8. third";
+        let p = plain_text(&convert(md));
+        assert!(p.contains("2. real"), "expected '2. real': {p}");
+        assert!(p.contains("4. also real"), "expected '4. also real': {p}");
+        assert!(p.contains("8. third"), "expected '8. third': {p}");
+        assert!(
+            !p.contains("1. real") && !p.contains("3. also"),
+            "code-block numbers should not corrupt list: {p}"
+        );
+    }
+
+    #[test]
+    fn two_ordered_lists_same_depth() {
+        let md = "2. a\n4. b\n\n3. x\n5. y";
+        let p = plain_text(&convert(md));
+        assert!(p.contains("2. "), "first list item 2: {p}");
+        assert!(p.contains("4. "), "first list item 4: {p}");
+        assert!(p.contains("3. "), "second list item 3: {p}");
+        assert!(p.contains("5. "), "second list item 5: {p}");
+    }
+
+    #[test]
+    fn ordered_list_in_blockquote() {
+        let md = "> 2. alpha\n> 4. beta\n> 8. gamma";
+        let p = plain_text(&convert(md));
+        assert!(p.contains("2. alpha"), "item 2: {p}");
+        assert!(p.contains("4. beta"), "item 4: {p}");
+        assert!(p.contains("8. gamma"), "item 8: {p}");
+        assert!(!p.contains("3. "), "should not renumber: {p}");
     }
 }
